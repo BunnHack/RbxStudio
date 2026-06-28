@@ -1,0 +1,6 @@
+{
+  "name": "Roblox Studio Clone",
+  "description": "An interactive, high-fidelity Roblox Studio editor clone featuring a full 3D viewport, orbit camera, Ribbon controls, hierarchical Explorer tree, Property editor, drag-and-drop Toolbox, multi-tab Script Editor, and a functional Lua-like command console with physics simulation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
