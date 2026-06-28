@@ -63,6 +63,27 @@ class BinaryReader {
     return val;
   }
 
+  get Int64(): number {
+    if (this.offset + 8 > this.data.length) return 0;
+    const low = this.view.getInt32(this.offset, true);
+    const high = this.view.getInt32(this.offset + 4, true);
+    this.offset += 8;
+    // Handle sign
+    if (high < 0) {
+      // Negative: use BigInt for precise calculation, then convert to number
+      return Number(BigInt(high) * 0x100000000n + BigInt(low >>> 0));
+    }
+    return high * 0x100000000 + (low >>> 0);
+  }
+
+  get Uint64(): number {
+    if (this.offset + 8 > this.data.length) return 0;
+    const low = this.view.getUint32(this.offset, true);
+    const high = this.view.getUint32(this.offset + 4, true);
+    this.offset += 8;
+    return high * 0x100000000 + low;
+  }
+
   get String(): string {
     const len = this.Uint32;
     if (len <= 0 || this.offset + len > this.data.length) return '';
@@ -199,7 +220,7 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
             value = chunkReader.Int32;
             break;
           case 0x04: // Int64
-            value = Number(chunkReader.Float64);
+            value = chunkReader.Int64;
             break;
           case 0x05: // Float32
             value = chunkReader.Float32;
@@ -252,12 +273,70 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
               value = { family, weight, style, cachedFaceId };
             }
             break;
+          case 0x13: // SecurityCapabilities
+            {
+              const capCount = chunkReader.Int32;
+              const flags = chunkReader.bytes(capCount);
+              let capVal = 0;
+              for (let f = 0; f < flags.length; f++) {
+                capVal = (capVal << 8) | flags[f];
+              }
+              value = capVal;
+            }
+            break;
+          case 0x1B: // SourceAssetId — variable length
+            {
+              const len = chunkReader.Uint8;
+              switch (len) {
+                case 0:  value = 0; break;
+                case 1:  value = chunkReader.Uint8; break;
+                case 2:  value = chunkReader.Int32 & 0xFFFF; break;
+                case 4:  value = chunkReader.Int32; break;
+                case 8:  value = chunkReader.Int64; break;
+                default: value = 0; break;
+              }
+            }
+            break;
           case 0x1D: // BinaryString
             value = chunkReader.BinaryString;
             break;
-          default:
-            // safety boundary skip
+          case 0x21: // AttributesSerialize — key-value dictionary
+            {
+              const totalSize = chunkReader.Int32;
+              if (totalSize === 0) {
+                value = {};
+              } else {
+                const attrBytes = chunkReader.bytes(totalSize);
+                value = { _raw: Array.from(attrBytes) };
+              }
+            }
             break;
+          case 0x29: // Tags — array of tags
+            {
+              const totalSize = chunkReader.Int32;
+              if (totalSize === 0) {
+                value = [];
+              } else {
+                const tagBytes = chunkReader.bytes(totalSize);
+                const tagReader = new BinaryReader(tagBytes);
+                const tags: string[] = [];
+                while (tagReader.remaining > 0) {
+                  const tagLen = tagReader.Uint8;
+                  if (tagLen === 0) break;
+                  tags.push(new TextDecoder().decode(tagReader.bytes(tagLen)));
+                }
+                value = tags;
+              }
+            }
+            break;
+          default: {
+            console.warn(`Unknown PROP data type 0x${dataType.toString(16)} for "${propertyName}", skipping remaining values`);
+            while (values.length < count) {
+              values.push(null);
+            }
+            i = count; // Force break the loop
+            break;
+          }
         }
         values.push(value);
       }
@@ -329,6 +408,56 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
     }
   }
 
+  const parseColorToHex = (colorObj: any): string | undefined => {
+    if (!colorObj) return undefined;
+    if (typeof colorObj === 'string') return colorObj;
+    if (typeof colorObj === 'object') {
+      const r = colorObj.r ?? 0;
+      const g = colorObj.g ?? 0;
+      const b = colorObj.b ?? 0;
+      // Auto-detect: if any value > 1, it's uint8 range (0-255)
+      const isUint8 = r > 1 || g > 1 || b > 1;
+      const toHex = (v: number) => {
+        const val = isUint8 ? Math.round(v) : Math.round(v * 255);
+        const hex = Math.max(0, Math.min(255, val)).toString(16);
+        return hex.length === 1 ? '0' + hex : hex;
+      };
+      return '#' + toHex(r) + toHex(g) + toHex(b);
+    }
+    return undefined;
+  };
+
+  const materialEnumMap: Record<number, string> = {
+    256:  'Plastic',
+    272:  'Neon',
+    288:  'Wood',
+    304:  'WoodPlanks',
+    336:  'Glass',
+    352:  'Asphalt',
+    368:  'Concrete',
+    384:  'Granite',
+    400:  'Marble',
+    416:  'Sand',
+    432:  'Fabric',
+    448:  'DiamondPlate',
+    464:  'Foil',
+    480:  'Ice',
+    512:  'SmoothPlastic',
+    528:  'Brick',
+    544:  'Cobblestone',
+    560:  'Sand',
+    784:  'Metal',
+    816:  'Brick',
+    1040: 'Metal',
+    1056: 'Slate',
+    1264: 'Grass',
+    1280: 'LeafyGrass',
+    1296: 'Salt',
+    1312: 'Snow',
+    1328: 'Mud',
+    1344: 'Pavement',
+  };
+
   // 4. Map back to RobloxInstance schema
   return Object.values(tempInstances).map((temp) => {
     const mappedProps: any = {};
@@ -356,17 +485,6 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
     }
 
     if (props.Material !== undefined) {
-      const materialEnumMap: Record<number, string> = {
-        256: 'Plastic',
-        512: 'SmoothPlastic',
-        272: 'Neon',
-        288: 'Wood',
-        1056: 'Slate',
-        336: 'Glass',
-        1264: 'Grass',
-        816: 'Brick',
-        1040: 'Metal'
-      };
       if (typeof props.Material === 'number') {
         mappedProps.Material = materialEnumMap[props.Material] || 'Plastic';
       } else {
@@ -374,46 +492,33 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
       }
     }
 
-    if (props.Color) {
-      if (typeof props.Color === 'object') {
-        const r = props.Color.r ?? 0;
-        const g = props.Color.g ?? 0;
-        const b = props.Color.b ?? 0;
-        const toHex = (v: number) => {
-          const hex = Math.round(v * 255).toString(16);
-          return hex.length === 1 ? '0' + hex : hex;
-        };
-        mappedProps.Color = '#' + toHex(r) + toHex(g) + toHex(b);
-      } else {
-        mappedProps.Color = props.Color;
-      }
-    } else if (props.Color3) {
-      const r = props.Color3.r ?? 0;
-      const g = props.Color3.g ?? 0;
-      const b = props.Color3.b ?? 0;
-      const toHex = (v: number) => {
-        const hex = Math.round(v * 255).toString(16);
-        return hex.length === 1 ? '0' + hex : hex;
-      };
-      mappedProps.Color = '#' + toHex(r) + toHex(g) + toHex(b);
-    } else if (props.Color3uint8) {
-      const r = props.Color3uint8.r ?? 0;
-      const g = props.Color3uint8.g ?? 0;
-      const b = props.Color3uint8.b ?? 0;
-      const toHex = (v: number) => {
-        const hex = v.toString(16);
-        return hex.length === 1 ? '0' + hex : hex;
-      };
-      mappedProps.Color = '#' + toHex(r) + toHex(g) + toHex(b);
+    const parsedColor = parseColorToHex(props.Color || props.Color3 || props.Color3uint8);
+    if (parsedColor) {
+      mappedProps.Color = parsedColor;
     }
 
-    mappedProps.Rotation = { x: 0, y: 0, z: 0 };
+    // Extract Euler angles ZYX order from CFrame rotation matrix
+    if (props.CFrame && props.CFrame.rotation) {
+      const r = props.CFrame.rotation; // 9 floats (3x3 matrix)
+      const sinY = Math.max(-1, Math.min(1, -r[6]));
+      const angleY = Math.asin(sinY);
+      const angleX = Math.atan2(r[7], r[8]);
+      const angleZ = Math.atan2(r[3], r[0]);
+      mappedProps.Rotation = {
+        x: Number.isNaN(angleX) ? 0 : (angleX * 180) / Math.PI,
+        y: Number.isNaN(angleY) ? 0 : (angleY * 180) / Math.PI,
+        z: Number.isNaN(angleZ) ? 0 : (angleZ * 180) / Math.PI,
+      };
+    } else {
+      mappedProps.Rotation = { x: 0, y: 0, z: 0 };
+    }
 
     return {
       id: temp.referentId.toString(),
       name: props.Name || temp.className,
       className: temp.className as InstanceClass,
       parentId: temp.parentId !== null ? temp.parentId.toString() : null,
+      rawProperties: props,
       properties: mappedProps,
     };
   });
@@ -503,15 +608,34 @@ function parseXmlItem(element: Element, parentId: string | null): RobloxInstance
 
   if (properties.Material !== undefined) {
     const materialEnumMap: Record<number, string> = {
-      256: 'Plastic',
-      512: 'SmoothPlastic',
-      272: 'Neon',
-      288: 'Wood',
+      256:  'Plastic',
+      272:  'Neon',
+      288:  'Wood',
+      304:  'WoodPlanks',
+      336:  'Glass',
+      352:  'Asphalt',
+      368:  'Concrete',
+      384:  'Granite',
+      400:  'Marble',
+      416:  'Sand',
+      432:  'Fabric',
+      448:  'DiamondPlate',
+      464:  'Foil',
+      480:  'Ice',
+      512:  'SmoothPlastic',
+      528:  'Brick',
+      544:  'Cobblestone',
+      560:  'Sand',
+      784:  'Metal',
+      816:  'Brick',
+      1040: 'Metal',
       1056: 'Slate',
-      336: 'Glass',
       1264: 'Grass',
-      816: 'Brick',
-      1040: 'Metal'
+      1280: 'LeafyGrass',
+      1296: 'Salt',
+      1312: 'Snow',
+      1328: 'Mud',
+      1344: 'Pavement',
     };
     if (typeof properties.Material === 'number') {
       mappedProps.Material = materialEnumMap[properties.Material] || 'Plastic';
@@ -544,6 +668,7 @@ function parseXmlItem(element: Element, parentId: string | null): RobloxInstance
     name: properties.Name || className,
     className: className as InstanceClass,
     parentId,
+    rawProperties: properties,
     properties: mappedProps,
   };
 

@@ -45,6 +45,7 @@ export interface RobloxInstance {
   name: string;
   className: InstanceClass;
   parentId: string | null;
+  rawProperties?: Record<string, any>;
   properties: {
     // Common properties
     Name?: string;
