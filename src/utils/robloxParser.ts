@@ -4,7 +4,18 @@
  */
 
 import { decompress } from 'fzstd';
+import * as lz4js from 'lz4js';
 import { RobloxInstance, Vector3, PartMaterial, InstanceClass } from '../types';
+
+function isZstd(data: Uint8Array): boolean {
+  return (
+    data.length >= 4 &&
+    data[0] === 0x28 &&
+    data[1] === 0xb5 &&
+    data[2] === 0x2f &&
+    data[3] === 0xfd
+  );
+}
 
 /**
  * Binary Reader Helper
@@ -143,11 +154,10 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
     throw new Error('Not a valid Roblox binary file (invalid magic).');
   }
 
-  // Header parsing (aligned perfectly to offset 14 bytes)
-  reader.seek(14);
-  const version = reader.Int32;
-  const classCount = reader.Int32;
-  const instanceCount = reader.Int32;
+  // Header parsing (aligned perfectly to offset 16 bytes)
+  reader.seek(16);
+  const classCount = reader.Uint32;
+  const instanceCount = reader.Uint32;
   reader.skip(8); // reserved
 
   const classes: Record<number, ClassDef> = {};
@@ -166,7 +176,11 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
     const compressedData = reader.bytes(compressedLen);
 
     let decompressed: Uint8Array;
-    if (compressedLen > 0) {
+    if (compressedLen === 0) {
+      decompressed = new Uint8Array(0);
+    } else if (compressedLen === uncompressedLen) {
+      decompressed = compressedData;
+    } else if (isZstd(compressedData)) {
       try {
         decompressed = decompress(compressedData);
       } catch (err) {
@@ -174,7 +188,13 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
         decompressed = new Uint8Array(uncompressedLen);
       }
     } else {
-      decompressed = new Uint8Array(0);
+      try {
+        decompressed = new Uint8Array(uncompressedLen);
+        lz4js.decompressBlock(compressedData, decompressed, 0, compressedLen, 0);
+      } catch (err) {
+        console.warn(`LZ4 decompression failed for chunk ${chunkName}, using raw fallback:`, err);
+        decompressed = compressedData;
+      }
     }
 
     const chunkReader = new BinaryReader(decompressed);
@@ -205,6 +225,7 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
       const count = classDef ? classDef.instanceIds.length : 0;
       const values: any[] = [];
 
+      outerLoop:
       for (let i = 0; i < count; i++) {
         if (chunkReader.remaining === 0) break;
 
@@ -290,7 +311,12 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
               switch (len) {
                 case 0:  value = 0; break;
                 case 1:  value = chunkReader.Uint8; break;
-                case 2:  value = chunkReader.Int32 & 0xFFFF; break;
+                case 2: {
+                  const b1 = chunkReader.Uint8;
+                  const b2 = chunkReader.Uint8;
+                  value = (b2 << 8) | b1; // little-endian uint16
+                  break;
+                }
                 case 4:  value = chunkReader.Int32; break;
                 case 8:  value = chunkReader.Int64; break;
                 default: value = 0; break;
@@ -334,8 +360,7 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
             while (values.length < count) {
               values.push(null);
             }
-            i = count; // Force break the loop
-            break;
+            break outerLoop;
           }
         }
         values.push(value);
@@ -468,7 +493,13 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
     if (props.CanCollide !== undefined) mappedProps.CanCollide = props.CanCollide;
     if (props.Transparency !== undefined) mappedProps.Transparency = props.Transparency;
     if (props.Reflectance !== undefined) mappedProps.Reflectance = props.Reflectance;
-    if (props.Source !== undefined) mappedProps.Source = props.Source;
+    if (props.Source !== undefined) {
+      if (props.Source instanceof Uint8Array) {
+        mappedProps.Source = new TextDecoder().decode(props.Source);
+      } else {
+        mappedProps.Source = props.Source;
+      }
+    }
     if (props.Enabled !== undefined) mappedProps.Enabled = props.Enabled;
     if (props.Brightness !== undefined) mappedProps.Brightness = props.Brightness;
     if (props.TimeOfDay !== undefined) mappedProps.TimeOfDay = props.TimeOfDay;
@@ -561,12 +592,22 @@ function parseXmlItem(element: Element, parentId: string | null): RobloxInstance
         const xNode = propNode.querySelector('X');
         const yNode = propNode.querySelector('Y');
         const zNode = propNode.querySelector('Z');
+        
+        const rotation: number[] = [];
+        for (let ri = 0; ri < 3; ri++) {
+          for (let rj = 0; rj < 3; rj++) {
+            const rNode = propNode.querySelector(`R${ri}${rj}`);
+            rotation.push(parseFloat(rNode?.textContent || '0'));
+          }
+        }
+
         properties[name] = {
           Position: {
             x: parseFloat(xNode?.textContent || '0'),
             y: parseFloat(yNode?.textContent || '0'),
             z: parseFloat(zNode?.textContent || '0'),
-          }
+          },
+          rotation,
         };
       } else if (tagName === 'color3' || tagName === 'color3uint8') {
         const rNode = propNode.querySelector('R');
@@ -661,7 +702,21 @@ function parseXmlItem(element: Element, parentId: string | null): RobloxInstance
     mappedProps.Color = properties.Color3uint8;
   }
 
-  mappedProps.Rotation = { x: 0, y: 0, z: 0 };
+  // Extract Euler angles ZYX order from CFrame rotation matrix for XML
+  if (properties.CFrame && properties.CFrame.rotation && properties.CFrame.rotation.length === 9) {
+    const r = properties.CFrame.rotation; // 9 floats (3x3 matrix)
+    const sinY = Math.max(-1, Math.min(1, -r[6]));
+    const angleY = Math.asin(sinY);
+    const angleX = Math.atan2(r[7], r[8]);
+    const angleZ = Math.atan2(r[3], r[0]);
+    mappedProps.Rotation = {
+      x: Number.isNaN(angleX) ? 0 : (angleX * 180) / Math.PI,
+      y: Number.isNaN(angleY) ? 0 : (angleY * 180) / Math.PI,
+      z: Number.isNaN(angleZ) ? 0 : (angleZ * 180) / Math.PI,
+    };
+  } else {
+    mappedProps.Rotation = { x: 0, y: 0, z: 0 };
+  }
 
   const inst: RobloxInstance = {
     id: referent,
