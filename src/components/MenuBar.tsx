@@ -30,6 +30,7 @@ import {
   Award
 } from 'lucide-react';
 import { RobloxInstance } from '../types';
+import { exportToRobloxXml } from '../utils/robloxExporter';
 
 interface MenuBarProps {
   state: ReturnType<typeof import('../hooks/useRobloxState').useRobloxState>;
@@ -272,6 +273,44 @@ export default function MenuBar({
     addLog(`Exported place JSON successfully: '${placeName}'`, 'success');
   };
 
+  const handleExportRbxl = () => {
+    try {
+      const xml = exportToRobloxXml(instances, null, true);
+      const dataStr = 'data:text/xml;charset=utf-8,' + encodeURIComponent(xml);
+      const downloadAnchor = document.createElement('a');
+      downloadAnchor.setAttribute('href', dataStr);
+      downloadAnchor.setAttribute('download', `${placeName.replace(/\s+/g, '_') || 'place'}.rbxl`);
+      document.body.appendChild(downloadAnchor);
+      downloadAnchor.click();
+      downloadAnchor.remove();
+      addLog(`Exported Roblox Place file successfully: '${placeName}.rbxl'`, 'success');
+    } catch (err: any) {
+      addLog(`Failed to export Place file: ${err.message}`, 'error');
+    }
+  };
+
+  const handleExportRbxm = () => {
+    try {
+      if (!selectedInstanceId) {
+        addLog('No instance selected to export. Please select an object in the Explorer tree first.', 'warn');
+        alert('Please select an instance in the Explorer tree to export as a .rbxm model.');
+        return;
+      }
+      const selected = instances[selectedInstanceId];
+      const xml = exportToRobloxXml(instances, selectedInstanceId, false);
+      const dataStr = 'data:text/xml;charset=utf-8,' + encodeURIComponent(xml);
+      const downloadAnchor = document.createElement('a');
+      downloadAnchor.setAttribute('href', dataStr);
+      downloadAnchor.setAttribute('download', `${selected.name.replace(/\s+/g, '_') || 'model'}.rbxm`);
+      document.body.appendChild(downloadAnchor);
+      downloadAnchor.click();
+      downloadAnchor.remove();
+      addLog(`Exported Roblox Model file successfully: '${selected.name}.rbxm'`, 'success');
+    } catch (err: any) {
+      addLog(`Failed to export Model file: ${err.message}`, 'error');
+    }
+  };
+
   // Simulated manual save slot creation
   const handleSaveAsSlot = () => {
     const slotName = prompt('Enter a name for this backup slot:', `Save Slot #${saveSlots.length + 1}`);
@@ -469,8 +508,14 @@ game.Lighting.Ambient = Color3.fromRGB(120, 80, 70)`,
                         📐 Mesh Importer...
                       </button>
                       
-                      <button onClick={() => triggerAction('Export Place', handleExportJSON)} className="w-full text-left px-3 py-1.5 hover:bg-[#007ACC] hover:text-white flex items-center justify-between transition cursor-pointer">
-                        📤 Export Place as JSON
+                      <button onClick={() => triggerAction('Export Place (.rbxl)', handleExportRbxl)} className="w-full text-left px-3 py-1.5 hover:bg-[#007ACC] hover:text-white flex items-center justify-between transition cursor-pointer text-yellow-400 font-bold">
+                        <span>📤 Export Place (.rbxl)</span>
+                      </button>
+                      <button onClick={() => triggerAction('Export Selected Model (.rbxm)', handleExportRbxm)} className="w-full text-left px-3 py-1.5 hover:bg-[#007ACC] hover:text-white flex items-center justify-between transition cursor-pointer text-blue-400 font-bold">
+                        <span>📦 Export Selected (.rbxm)</span>
+                      </button>
+                      <button onClick={() => triggerAction('Export Place', handleExportJSON)} className="w-full text-left px-3 py-1.5 hover:bg-[#007ACC] hover:text-white flex items-center justify-between transition cursor-pointer text-gray-400">
+                        <span>📄 Export Place as JSON</span>
                       </button>
                       <hr className="border-[#1A1C1F] my-1" />
                       <button onClick={() => triggerAction('Save', () => { addLog('Successfully saved workspace locally to state.', 'success'); })} className="w-full text-left px-3 py-1.5 hover:bg-[#007ACC] hover:text-white flex items-center justify-between transition cursor-pointer">
@@ -486,8 +531,8 @@ game.Lighting.Ambient = Color3.fromRGB(120, 80, 70)`,
                       })} className="w-full text-left px-3 py-1.5 hover:bg-[#007ACC] hover:text-white flex items-center transition cursor-pointer">
                         ☁️ Publish to Roblox
                       </button>
-                      <button onClick={() => triggerAction('Download Copy', handleExportJSON)} className="w-full text-left px-3 py-1.5 hover:bg-[#007ACC] hover:text-white flex items-center transition cursor-pointer">
-                        📥 Download a Copy
+                      <button onClick={() => triggerAction('Download Copy (.rbxl)', handleExportRbxl)} className="w-full text-left px-3 py-1.5 hover:bg-[#007ACC] hover:text-white flex items-center justify-between transition cursor-pointer text-yellow-400 font-bold">
+                        <span>📥 Download .rbxl Place Copy</span>
                       </button>
                       <hr className="border-[#1A1C1F] my-1" />
                       <button onClick={() => triggerAction('Game Settings', () => setShowGameSettingsModal(true))} className="w-full text-left px-3 py-1.5 hover:bg-[#007ACC] hover:text-white flex items-center transition cursor-pointer">

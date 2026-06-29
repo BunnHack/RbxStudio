@@ -376,7 +376,6 @@ export function useRobloxState() {
       'StarterGui',
       'StarterPack',
       'StarterPlayer',
-      'Baseplate',
     ];
     if (protectedIds.includes(instanceId)) {
       addLog(`Cannot delete core system service/part '${instanceId}'.`, 'warn');
@@ -1451,6 +1450,42 @@ end
     }
   }, [saveToHistory, selectedInstanceId, addLog, setSelectedInstanceId, setOpenScripts, setActiveScriptInstanceId, setViewportTab, setInstances, setExpandedInstanceIds]);
 
+  // Toggle or recreate Baseplate
+  const toggleBaseplate = useCallback(() => {
+    saveToHistory();
+    setInstances((prev) => {
+      const next = { ...prev };
+      if (next['Baseplate']) {
+        delete next['Baseplate'];
+        addLog('Baseplate removed.', 'success');
+      } else {
+        next['Baseplate'] = {
+          id: 'Baseplate',
+          name: 'Baseplate',
+          className: 'Part',
+          parentId: 'Workspace',
+          properties: {
+            Name: 'Baseplate',
+            ClassName: 'Part',
+            Color: '#3A5F25', // Nice grass green
+            Material: 'Grass',
+            Size: { x: 100, y: 1, z: 100 },
+            Position: { x: 0, y: -0.5, z: 0 },
+            Rotation: { x: 0, y: 0, z: 0 },
+            Anchored: true,
+            CanCollide: true,
+            Transparency: 0,
+            Reflectance: 0.1,
+            Shape: 'Block',
+            Locked: true,
+          },
+        };
+        addLog('Baseplate inserted at origin.', 'success');
+      }
+      return next;
+    });
+  }, [saveToHistory, addLog]);
+
   return {
     instances,
     selectedInstanceId,
@@ -1515,5 +1550,6 @@ end
     unlockAll,
     loadSampleTemplate,
     importRobloxFile,
+    toggleBaseplate,
   };
 }

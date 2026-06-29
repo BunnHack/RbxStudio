@@ -159,6 +159,7 @@ export default function Viewport({ state }: ViewportProps) {
   const dragStart = useRef({ x: 0, y: 0, pitch: 0, yaw: 0 });
   const viewportRef = useRef<HTMLDivElement>(null);
   const mouseDownPos = useRef({ x: 0, y: 0 });
+  const touchStartDist = useRef<number | null>(null);
 
   // Three.js Core Refs
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
@@ -330,6 +331,109 @@ export default function Viewport({ state }: ViewportProps) {
 
   const handlePreventContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
+  };
+
+  // Touch handlers for mobile screen moving / orbiting & pinch zoom
+  const handleTouchStart = (e: React.TouchEvent) => {
+    if (e.touches.length === 1) {
+      // Single finger drag to orbit
+      const touch = e.touches[0];
+      mouseDownPos.current = { x: touch.clientX, y: touch.clientY };
+      
+      let hitPart = false;
+      if (rendererRef.current && cameraRef.current) {
+        const rect = rendererRef.current.domElement.getBoundingClientRect();
+        const x = ((touch.clientX - rect.left) / rect.width) * 2 - 1;
+        const y = -((touch.clientY - rect.top) / rect.height) * 2 + 1;
+        const raycaster = new THREE.Raycaster();
+        raycaster.setFromCamera(new THREE.Vector2(x, y), cameraRef.current);
+        const intersects = raycaster.intersectObjects(Object.values(meshesRef.current), true);
+        if (intersects.length > 0) {
+          hitPart = true;
+        }
+      }
+
+      setIsOrbiting(true);
+      dragStart.current = {
+        x: touch.clientX,
+        y: touch.clientY,
+        pitch,
+        yaw,
+      };
+    } else if (e.touches.length === 2) {
+      // Two finger pinch to zoom
+      const t1 = e.touches[0];
+      const t2 = e.touches[1];
+      const dist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+      touchStartDist.current = dist;
+    }
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (e.touches.length === 1 && isOrbiting) {
+      if (e.cancelable) e.preventDefault();
+      const touch = e.touches[0];
+      const dx = touch.clientX - dragStart.current.x;
+      const dy = touch.clientY - dragStart.current.y;
+
+      setYaw((dragStart.current.yaw - dx * 0.5) % 360);
+      setPitch(Math.max(-85, Math.min(85, dragStart.current.pitch + dy * 0.5)));
+    } else if (e.touches.length === 2 && touchStartDist.current !== null) {
+      if (e.cancelable) e.preventDefault();
+      const t1 = e.touches[0];
+      const t2 = e.touches[1];
+      const dist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+      const delta = touchStartDist.current - dist;
+      setDistance((prev) => Math.max(80, Math.min(1000, prev + delta * 1.5)));
+      touchStartDist.current = dist;
+    }
+  };
+
+  const handleTouchEnd = (e: React.TouchEvent) => {
+    setIsOrbiting(false);
+    touchStartDist.current = null;
+
+    // Tap to select logic
+    if (e.changedTouches.length === 1 && mouseDownPos.current) {
+      const touch = e.changedTouches[0];
+      const dx = touch.clientX - mouseDownPos.current.x;
+      const dy = touch.clientY - mouseDownPos.current.y;
+      const dist = Math.hypot(dx, dy);
+
+      if (dist < 10) { // slightly larger threshold for tap on mobile
+        if (rendererRef.current && cameraRef.current && sceneRef.current) {
+          const rect = rendererRef.current.domElement.getBoundingClientRect();
+          const x = ((touch.clientX - rect.left) / rect.width) * 2 - 1;
+          const y = -((touch.clientY - rect.top) / rect.height) * 2 + 1;
+
+          const raycaster = new THREE.Raycaster();
+          raycaster.setFromCamera(new THREE.Vector2(x, y), cameraRef.current);
+          const intersects = raycaster.intersectObjects(Object.values(meshesRef.current), true);
+
+          if (intersects.length > 0) {
+            let hitObj: THREE.Object3D | null = intersects[0].object;
+            let partId: string | undefined = undefined;
+
+            while (hitObj && hitObj !== sceneRef.current) {
+              partId = Object.keys(meshesRef.current).find(key => meshesRef.current[key] === hitObj);
+              if (partId) break;
+              hitObj = hitObj.parent;
+            }
+
+            if (partId) {
+              const inst = instances[partId];
+              if (inst?.properties.Locked && activeTool === 'Select') {
+                addLog(`Instance '${inst.name}' is Locked. Unlock in Properties to edit.`, 'warn');
+                return;
+              }
+              setSelectedInstanceId(partId);
+            }
+          } else {
+            setSelectedInstanceId(null);
+          }
+        }
+      }
+    }
   };
 
   // Quick Shifters
@@ -635,6 +739,9 @@ export default function Viewport({ state }: ViewportProps) {
       onMouseLeave={() => setIsOrbiting(false)}
       onWheel={handleWheel}
       onContextMenu={handlePreventContextMenu}
+      onTouchStart={handleTouchStart}
+      onTouchMove={handleTouchMove}
+      onTouchEnd={handleTouchEnd}
       className="w-full h-full bg-[#181A1C] relative overflow-hidden select-none cursor-grab active:cursor-grabbing border-b border-[#101113]"
       id="studio-viewport"
     >

@@ -112,7 +112,8 @@ class BinaryReader {
   }
 
   bytes(len: number): Uint8Array {
-    const clampedLen = Math.min(len, this.remaining);
+    const safeLen = Number.isFinite(len) ? len : 0;
+    const clampedLen = Math.max(0, Math.min(safeLen, this.remaining));
     const bytes = this.data.subarray(this.offset, this.offset + clampedLen);
     this.offset += clampedLen;
     return bytes;
@@ -141,6 +142,375 @@ interface PropDef {
   values: any[];
 }
 
+function decodeInterleaved(src: Uint8Array, count: number, size: number): Uint8Array {
+  const expected = count * size;
+  const out = new Uint8Array(expected);
+  const safe = Math.min(src.length, expected);
+
+  let p = 0;
+  for (let byteIndex = 0; byteIndex < size; byteIndex++) {
+    for (let itemIndex = 0; itemIndex < count; itemIndex++) {
+      const dst = itemIndex * size + byteIndex;
+      if (p < safe) out[dst] = src[p++];
+    }
+  }
+  return out;
+}
+
+function zigZagDecode32(n: number): number {
+  return (n >>> 1) ^ -(n & 1);
+}
+
+function decodeReferentArray(reader: BinaryReader, count: number): number[] {
+  const raw = reader.bytes(count * 4);
+  const deinterleaved = decodeInterleaved(raw, count, 4);
+  const view = new DataView(
+    deinterleaved.buffer,
+    deinterleaved.byteOffset,
+    deinterleaved.byteLength
+  );
+
+  const out: number[] = [];
+  let last = 0;
+
+  for (let i = 0; i < count; i++) {
+    const encoded = view.getUint32(i * 4, false); // big-endian
+    const delta = zigZagDecode32(encoded);
+    last += delta;
+    out.push(last);
+  }
+
+  return out;
+}
+
+function decodeUint8ArrayValues(reader: BinaryReader, count: number): number[] {
+  return Array.from(reader.bytes(count));
+}
+
+function decodeBoolArray(reader: BinaryReader, count: number): boolean[] {
+  return decodeUint8ArrayValues(reader, count).map(v => v !== 0);
+}
+
+function decodeInt32Array(reader: BinaryReader, count: number): number[] {
+  const raw = reader.bytes(count * 4);
+  const deinterleaved = decodeInterleaved(raw, count, 4);
+  const view = new DataView(deinterleaved.buffer, deinterleaved.byteOffset, deinterleaved.byteLength);
+
+  const out: number[] = [];
+  for (let i = 0; i < count; i++) {
+    const encoded = view.getUint32(i * 4, false); // big-endian
+    out.push(zigZagDecode32(encoded));
+  }
+  return out;
+}
+
+function decodeRobloxFloat32Bits(encoded: number): number {
+  const rotated = ((encoded >>> 1) | (encoded << 31)) >>> 0;
+  const buf = new ArrayBuffer(4);
+  const view = new DataView(buf);
+  view.setUint32(0, rotated, false);
+  return view.getFloat32(0, false);
+}
+
+function decodeFloat32Array(reader: BinaryReader, count: number): number[] {
+  const raw = reader.bytes(count * 4);
+  const deinterleaved = decodeInterleaved(raw, count, 4);
+  const view = new DataView(deinterleaved.buffer, deinterleaved.byteOffset, deinterleaved.byteLength);
+
+  const out: number[] = [];
+  for (let i = 0; i < count; i++) {
+    const encoded = view.getUint32(i * 4, false); // big-endian
+    out.push(decodeRobloxFloat32Bits(encoded));
+  }
+  return out;
+}
+
+function decodeColor3uint8Array(reader: BinaryReader, count: number) {
+  const raw = reader.bytes(count * 3);
+  const deinterleaved = decodeInterleaved(raw, count, 3);
+
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    out.push({
+      r: deinterleaved[i * 3 + 0],
+      g: deinterleaved[i * 3 + 1],
+      b: deinterleaved[i * 3 + 2],
+    });
+  }
+  return out;
+}
+
+function decodeColor3Array(reader: BinaryReader, count: number) {
+  const rs = decodeFloat32Array(reader, count);
+  const gs = decodeFloat32Array(reader, count);
+  const bs = decodeFloat32Array(reader, count);
+
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    out.push({ r: rs[i], g: gs[i], b: bs[i] });
+  }
+  return out;
+}
+
+function decodeVector3Array(reader: BinaryReader, count: number) {
+  const xs = decodeFloat32Array(reader, count);
+  const ys = decodeFloat32Array(reader, count);
+  const zs = decodeFloat32Array(reader, count);
+
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    out.push({ x: xs[i], y: ys[i], z: zs[i] });
+  }
+  return out;
+}
+
+function getPresetMatrix(id: number): number[] {
+  if (id === 2) {
+    return [1, 0, 0,  0, 1, 0,  0, 0, 1];
+  }
+  const axes = [
+    [1, 0, 0],
+    [-1, 0, 0],
+    [0, 1, 0],
+    [0, -1, 0],
+    [0, 0, 1],
+    [0, 0, -1]
+  ];
+  const list: number[][] = [];
+  list.push([1, 0, 0,  0, 1, 0,  0, 0, 1]);
+  
+  for (const c1 of axes) {
+    for (const c2 of axes) {
+      const dot = c1[0]*c2[0] + c1[1]*c2[1] + c1[2]*c2[2];
+      if (dot === 0) {
+        const c3 = [
+          c1[1]*c2[2] - c1[2]*c2[1],
+          c1[2]*c2[0] - c1[0]*c2[2],
+          c1[0]*c2[1] - c1[1]*c2[0]
+        ];
+        const mat = [
+          c1[0], c2[0], c3[0],
+          c1[1], c2[1], c3[1],
+          c1[2], c2[2], c3[2]
+        ];
+        const isIdentity = mat[0] === 1 && mat[4] === 1 && mat[8] === 1 &&
+                           mat[1] === 0 && mat[2] === 0 && mat[3] === 0 &&
+                           mat[5] === 0 && mat[6] === 0 && mat[7] === 0;
+        if (!isIdentity) {
+          list.push(mat);
+        }
+      }
+    }
+  }
+  const idx = (id - 2) % list.length;
+  return list[idx] || [1, 0, 0,  0, 1, 0,  0, 0, 1];
+}
+
+function decodeCFrameArray(reader: BinaryReader, count: number) {
+  const orientations = Array.from(reader.bytes(count));
+  const xs = decodeFloat32Array(reader, count);
+  const ys = decodeFloat32Array(reader, count);
+  const zs = decodeFloat32Array(reader, count);
+  
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    const orientationId = orientations[i];
+    let rotation: number[];
+    if (orientationId === 0) {
+      rotation = [];
+      for (let r = 0; r < 9; r++) {
+        rotation.push(reader.Float32);
+      }
+    } else {
+      rotation = getPresetMatrix(orientationId);
+    }
+    out.push({
+      position: [xs[i], ys[i], zs[i]],
+      rotation: rotation
+    });
+  }
+  return out;
+}
+
+function decodePropValues(reader: BinaryReader, dataType: number, count: number): any[] {
+  switch (dataType) {
+    case 0x01: { // String
+      const out: string[] = [];
+      for (let i = 0; i < count; i++) out.push(reader.String);
+      return out;
+    }
+
+    case 0x02: // Bool
+      return decodeBoolArray(reader, count);
+
+    case 0x03: // Int32
+    case 0x0A: // Enum (usually behaves like Int32)
+      return decodeInt32Array(reader, count);
+
+    case 0x04: { // Int64
+      const out: number[] = [];
+      for (let i = 0; i < count; i++) out.push(reader.Int64);
+      return out;
+    }
+
+    case 0x05: // Float32
+      return decodeFloat32Array(reader, count);
+
+    case 0x06: { // Float64
+      const out: number[] = [];
+      for (let i = 0; i < count; i++) out.push(reader.Float64);
+      return out;
+    }
+
+    case 0x07: { // UDim
+      const scales = decodeFloat32Array(reader, count);
+      const offsets = decodeInt32Array(reader, count);
+      const out = [];
+      for (let i = 0; i < count; i++) {
+        out.push({ scale: scales[i], offset: offsets[i] });
+      }
+      return out;
+    }
+
+    case 0x08: { // UDim2
+      const scaleXs = decodeFloat32Array(reader, count);
+      const scaleYs = decodeFloat32Array(reader, count);
+      const offsetXs = decodeInt32Array(reader, count);
+      const offsetYs = decodeInt32Array(reader, count);
+      const out = [];
+      for (let i = 0; i < count; i++) {
+        out.push({
+          scaleX: scaleXs[i], scaleY: scaleYs[i],
+          offsetX: offsetXs[i], offsetY: offsetYs[i]
+        });
+      }
+      return out;
+    }
+
+    case 0x09: // CFrame
+      return decodeCFrameArray(reader, count);
+
+    case 0x0B: // Referent
+      return decodeReferentArray(reader, count);
+
+    case 0x0C: // Vector3
+      return decodeVector3Array(reader, count);
+
+    case 0x0D: { // Vector2
+      const xs = decodeFloat32Array(reader, count);
+      const ys = decodeFloat32Array(reader, count);
+      const out = [];
+      for (let i = 0; i < count; i++) {
+        out.push({ x: xs[i], y: ys[i] });
+      }
+      return out;
+    }
+
+    case 0x0E: // Color3
+      return decodeColor3Array(reader, count);
+
+    case 0x10: // Color3uint8
+      return decodeColor3uint8Array(reader, count);
+
+    case 0x12: { // Font
+      const out = [];
+      for (let i = 0; i < count; i++) {
+        const family = reader.String;
+        const weight = reader.Uint8;
+        const style = reader.Uint8;
+        const hasCachedFaceId = reader.Uint8;
+        const cachedFaceId = hasCachedFaceId ? reader.String : null;
+        out.push({ family, weight, style, cachedFaceId });
+      }
+      return out;
+    }
+
+    case 0x13: { // SecurityCapabilities
+      const out = [];
+      for (let i = 0; i < count; i++) {
+        const capCount = reader.Int32;
+        const flags = reader.bytes(capCount);
+        let capVal = 0;
+        for (let f = 0; f < flags.length; f++) {
+          capVal = (capVal << 8) | flags[f];
+        }
+        out.push(capVal);
+      }
+      return out;
+    }
+
+    case 0x1B: { // SourceAssetId
+      const out = [];
+      for (let i = 0; i < count; i++) {
+        const len = reader.Uint8;
+        let val = 0;
+        switch (len) {
+          case 0:  val = 0; break;
+          case 1:  val = reader.Uint8; break;
+          case 2: {
+            const b1 = reader.Uint8;
+            const b2 = reader.Uint8;
+            val = (b2 << 8) | b1;
+            break;
+          }
+          case 4:  val = reader.Int32; break;
+          case 8:  val = reader.Int64; break;
+          default: val = 0; break;
+        }
+        out.push(val);
+      }
+      return out;
+    }
+
+    case 0x1D: { // BinaryString
+      const out = [];
+      for (let i = 0; i < count; i++) {
+        out.push(reader.BinaryString);
+      }
+      return out;
+    }
+
+    case 0x21: { // AttributesSerialize
+      const out = [];
+      for (let i = 0; i < count; i++) {
+        const totalSize = reader.Int32;
+        if (totalSize <= 0 || totalSize > reader.remaining) {
+          out.push({});
+        } else {
+          const attrBytes = reader.bytes(totalSize);
+          out.push({ _raw: Array.from(attrBytes) });
+        }
+      }
+      return out;
+    }
+
+    case 0x29: { // Tags
+      const out = [];
+      for (let i = 0; i < count; i++) {
+        const totalSize = reader.Int32;
+        if (totalSize <= 0 || totalSize > reader.remaining) {
+          out.push([]);
+        } else {
+          const tagBytes = reader.bytes(totalSize);
+          const tagReader = new BinaryReader(tagBytes);
+          const tags: string[] = [];
+          while (tagReader.remaining > 0) {
+            const tagLen = tagReader.Uint8;
+            if (tagLen <= 0 || tagLen > tagReader.remaining) break;
+            tags.push(new TextDecoder().decode(tagReader.bytes(tagLen)));
+          }
+          out.push(tags);
+        }
+      }
+      return out;
+    }
+
+    default:
+      console.warn(`Unhandled property data type 0x${dataType.toString(16)}`);
+      return new Array(count).fill(null);
+  }
+}
+
 /**
  * Parses Roblox Binary Format (.rbxm / .rbxl)
  */
@@ -160,6 +530,8 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
   const instanceCount = reader.Uint32;
   reader.skip(8); // reserved
 
+  console.log('header', { classCount, instanceCount });
+
   const classes: Record<number, ClassDef> = {};
   const properties: PropDef[] = [];
   let relations: { instanceIds: number[], parentIds: number[] } | null = null;
@@ -169,8 +541,8 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
     const chunkName = new TextDecoder().decode(nameBytes).replace(/\0/g, '');
     if (!chunkName || chunkName === '') break;
 
-    const compressedLen = reader.Int32;
-    const uncompressedLen = reader.Int32;
+    const compressedLen = reader.Uint32;
+    const uncompressedLen = reader.Uint32;
     reader.Int32; // skip reserved
 
     const compressedData = reader.bytes(compressedLen);
@@ -178,8 +550,6 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
     let decompressed: Uint8Array;
     if (compressedLen === 0) {
       decompressed = new Uint8Array(0);
-    } else if (compressedLen === uncompressedLen) {
-      decompressed = compressedData;
     } else if (isZstd(compressedData)) {
       try {
         decompressed = decompress(compressedData);
@@ -189,8 +559,20 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
       }
     } else {
       try {
-        decompressed = new Uint8Array(uncompressedLen);
-        lz4js.decompressBlock(compressedData, decompressed, 0, compressedLen, 0);
+        const out = new Uint8Array(uncompressedLen);
+        const wrote = lz4js.decompressBlock(
+          compressedData,
+          out,
+          0,
+          compressedData.length,
+          0
+        );
+
+        if (wrote < 0) {
+          throw new Error(`LZ4 returned ${wrote}`);
+        }
+
+        decompressed = wrote === uncompressedLen ? out : out.subarray(0, wrote);
       } catch (err) {
         console.warn(`LZ4 decompression failed for chunk ${chunkName}, using raw fallback:`, err);
         decompressed = compressedData;
@@ -204,11 +586,24 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
       const className = chunkReader.String;
       const category = chunkReader.Uint8;
       const count = chunkReader.Int32;
-      const instanceIds: number[] = [];
-      for (let i = 0; i < count; i++) {
-        instanceIds.push(chunkReader.Int32);
+
+      const instanceIds = decodeReferentArray(chunkReader, count);
+
+      if (chunkReader.remaining > 0) {
+        chunkReader.Uint8; // skip referent type
       }
-      chunkReader.Uint8; // skip referent type
+
+      if (category !== 0 && chunkReader.remaining >= count) {
+        chunkReader.bytes(count);
+      }
+
+      console.log('INST', {
+        typeId,
+        className,
+        category,
+        count,
+        instanceIds,
+      });
 
       classes[typeId] = {
         typeId,
@@ -223,148 +618,16 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
 
       const classDef = classes[typeId];
       const count = classDef ? classDef.instanceIds.length : 0;
-      const values: any[] = [];
 
-      outerLoop:
-      for (let i = 0; i < count; i++) {
-        if (chunkReader.remaining === 0) break;
+      const values = decodePropValues(chunkReader, dataType, count);
 
-        let value: any = null;
-        switch (dataType) {
-          case 0x01: // String
-            value = chunkReader.String;
-            break;
-          case 0x02: // Bool
-            value = chunkReader.Uint8 !== 0;
-            break;
-          case 0x03: // Int32
-            value = chunkReader.Int32;
-            break;
-          case 0x04: // Int64
-            value = chunkReader.Int64;
-            break;
-          case 0x05: // Float32
-            value = chunkReader.Float32;
-            break;
-          case 0x06: // Float64
-            value = chunkReader.Float64;
-            break;
-          case 0x07: // UDim
-            value = { scale: chunkReader.Float32, offset: chunkReader.Int32 };
-            break;
-          case 0x08: // UDim2
-            value = {
-              scaleX: chunkReader.Float32, scaleY: chunkReader.Float32,
-              offsetX: chunkReader.Int32, offsetY: chunkReader.Int32
-            };
-            break;
-          case 0x09: // CFrame
-            {
-              const rotation: number[] = [];
-              for (let r = 0; r < 9; r++) rotation.push(chunkReader.Float32);
-              const position = [chunkReader.Float32, chunkReader.Float32, chunkReader.Float32];
-              value = { rotation, position };
-            }
-            break;
-          case 0x0A: // Enum
-            value = chunkReader.Int32;
-            break;
-          case 0x0B: // Referent
-            value = chunkReader.Int32;
-            break;
-          case 0x0C: // Vector3
-            value = { x: chunkReader.Float32, y: chunkReader.Float32, z: chunkReader.Float32 };
-            break;
-          case 0x0D: // Vector2
-            value = { x: chunkReader.Float32, y: chunkReader.Float32 };
-            break;
-          case 0x0E: // Color3
-            value = { r: chunkReader.Float32, g: chunkReader.Float32, b: chunkReader.Float32 };
-            break;
-          case 0x10: // Color3uint8
-            value = { r: chunkReader.Uint8, g: chunkReader.Uint8, b: chunkReader.Uint8 };
-            break;
-          case 0x12: // Font
-            {
-              const family = chunkReader.String;
-              const weight = chunkReader.Uint8;
-              const style = chunkReader.Uint8;
-              const hasCachedFaceId = chunkReader.Uint8;
-              const cachedFaceId = hasCachedFaceId ? chunkReader.String : null;
-              value = { family, weight, style, cachedFaceId };
-            }
-            break;
-          case 0x13: // SecurityCapabilities
-            {
-              const capCount = chunkReader.Int32;
-              const flags = chunkReader.bytes(capCount);
-              let capVal = 0;
-              for (let f = 0; f < flags.length; f++) {
-                capVal = (capVal << 8) | flags[f];
-              }
-              value = capVal;
-            }
-            break;
-          case 0x1B: // SourceAssetId — variable length
-            {
-              const len = chunkReader.Uint8;
-              switch (len) {
-                case 0:  value = 0; break;
-                case 1:  value = chunkReader.Uint8; break;
-                case 2: {
-                  const b1 = chunkReader.Uint8;
-                  const b2 = chunkReader.Uint8;
-                  value = (b2 << 8) | b1; // little-endian uint16
-                  break;
-                }
-                case 4:  value = chunkReader.Int32; break;
-                case 8:  value = chunkReader.Int64; break;
-                default: value = 0; break;
-              }
-            }
-            break;
-          case 0x1D: // BinaryString
-            value = chunkReader.BinaryString;
-            break;
-          case 0x21: // AttributesSerialize — key-value dictionary
-            {
-              const totalSize = chunkReader.Int32;
-              if (totalSize === 0) {
-                value = {};
-              } else {
-                const attrBytes = chunkReader.bytes(totalSize);
-                value = { _raw: Array.from(attrBytes) };
-              }
-            }
-            break;
-          case 0x29: // Tags — array of tags
-            {
-              const totalSize = chunkReader.Int32;
-              if (totalSize === 0) {
-                value = [];
-              } else {
-                const tagBytes = chunkReader.bytes(totalSize);
-                const tagReader = new BinaryReader(tagBytes);
-                const tags: string[] = [];
-                while (tagReader.remaining > 0) {
-                  const tagLen = tagReader.Uint8;
-                  if (tagLen === 0) break;
-                  tags.push(new TextDecoder().decode(tagReader.bytes(tagLen)));
-                }
-                value = tags;
-              }
-            }
-            break;
-          default: {
-            console.warn(`Unknown PROP data type 0x${dataType.toString(16)} for "${propertyName}", skipping remaining values`);
-            while (values.length < count) {
-              values.push(null);
-            }
-            break outerLoop;
-          }
-        }
-        values.push(value);
-      }
+      console.log('PROP', {
+        className: classDef?.className,
+        propertyName,
+        dataType,
+        count,
+        sample: values.slice(0, 5),
+      });
 
       properties.push({
         typeId,
@@ -373,17 +636,14 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
         values,
       });
     } else if (chunkName === 'PRNT') {
-      chunkReader.Uint8; // version
+      const version = chunkReader.Uint8;
       const count = chunkReader.Int32;
-      const instanceIds: number[] = [];
-      for (let i = 0; i < count; i++) {
-        instanceIds.push(chunkReader.Int32);
-      }
-      const parentIds: number[] = [];
-      for (let i = 0; i < count; i++) {
-        parentIds.push(chunkReader.Int32);
-      }
-      relations = { instanceIds, parentIds };
+
+      const childIds = decodeReferentArray(chunkReader, count);
+      const parentIds = decodeReferentArray(chunkReader, count);
+
+      relations = { instanceIds: childIds, parentIds };
+      console.log('PRNT', relations);
     } else if (chunkName === 'END') {
       break;
     }

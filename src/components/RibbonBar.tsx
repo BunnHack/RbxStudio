@@ -367,6 +367,17 @@ export default function RibbonBar({ state }: RibbonBarProps) {
                   <Terminal size={16} className="text-orange-400" />
                   <span className="text-[10px] mt-1 scale-90 select-none">Script</span>
                 </button>
+
+                <button 
+                  onClick={state.toggleBaseplate} 
+                  title={state.instances.Baseplate ? "Remove Baseplate" : "Insert Baseplate"} 
+                  className="flex flex-col items-center justify-center p-1 rounded hover:bg-[#3E4249] text-gray-300 hover:text-white transition h-12 w-12"
+                >
+                  <Grid3X3 size={16} className={state.instances.Baseplate ? "text-green-400" : "text-gray-500"} />
+                  <span className="text-[10px] mt-1 scale-90 select-none leading-none truncate text-center w-full">
+                    {state.instances.Baseplate ? "Rem Base" : "Add Base"}
+                  </span>
+                </button>
               </div>
               <span className="text-[9px] text-gray-500 mt-1 select-none">Insert</span>
             </div>
