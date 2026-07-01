@@ -46,6 +46,13 @@ class BinaryReader {
     return val;
   }
 
+  get Uint16(): number {
+    if (this.offset + 2 > this.data.length) return 0;
+    const val = this.view.getUint16(this.offset, true);
+    this.offset += 2;
+    return val;
+  }
+
   get Int32(): number {
     if (this.offset + 4 > this.data.length) return 0;
     const val = this.view.getInt32(this.offset, true);
@@ -157,6 +164,61 @@ function decodeInterleaved(src: Uint8Array, count: number, size: number): Uint8A
   return out;
 }
 
+function zigZagDecode64(n: bigint): bigint {
+  return (n >> 1n) ^ (-(n & 1n));
+}
+
+function readBigEndianUint64(view: DataView, offset: number): bigint {
+  const hi = BigInt(view.getUint32(offset, false));
+  const lo = BigInt(view.getUint32(offset + 4, false));
+  return (hi << 32n) | lo;
+}
+
+function bigintToSafeJsValue(v: bigint): number | bigint {
+  const max = BigInt(Number.MAX_SAFE_INTEGER);
+  const min = BigInt(Number.MIN_SAFE_INTEGER);
+  return v <= max && v >= min ? Number(v) : v;
+}
+
+function decodeInt64Array(reader: BinaryReader, count: number): Array<number | bigint> {
+  const raw = reader.bytes(count * 8);
+  const deinterleaved = decodeInterleaved(raw, count, 8);
+  const view = new DataView(
+    deinterleaved.buffer,
+    deinterleaved.byteOffset,
+    deinterleaved.byteLength
+  );
+
+  const out: Array<number | bigint> = [];
+  for (let i = 0; i < count; i++) {
+    const encoded = readBigEndianUint64(view, i * 8);
+    const decoded = zigZagDecode64(encoded);
+    out.push(bigintToSafeJsValue(decoded));
+  }
+  return out;
+}
+
+function decodeBinaryStringArray(reader: BinaryReader, count: number): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  for (let i = 0; i < count; i++) {
+    out.push(reader.BinaryString);
+  }
+  return out;
+}
+
+function parseTagsBlob(tagBytes: Uint8Array): string[] {
+  const tagReader = new BinaryReader(tagBytes);
+  const tags: string[] = [];
+
+  while (tagReader.remaining > 0) {
+    const tagLen = tagReader.Uint8;
+    if (tagLen <= 0 || tagLen > tagReader.remaining) break;
+    tags.push(new TextDecoder().decode(tagReader.bytes(tagLen)));
+  }
+
+  return tags;
+}
+
 function zigZagDecode32(n: number): number {
   return (n >>> 1) ^ -(n & 1);
 }
@@ -226,16 +288,33 @@ function decodeFloat32Array(reader: BinaryReader, count: number): number[] {
 }
 
 function decodeColor3uint8Array(reader: BinaryReader, count: number) {
-  const raw = reader.bytes(count * 3);
-  const deinterleaved = decodeInterleaved(raw, count, 3);
+  const rs = reader.bytes(count);
+  const gs = reader.bytes(count);
+  const bs = reader.bytes(count);
 
   const out = [];
   for (let i = 0; i < count; i++) {
     out.push({
-      r: deinterleaved[i * 3 + 0],
-      g: deinterleaved[i * 3 + 1],
-      b: deinterleaved[i * 3 + 2],
+      r: rs[i] ?? 0,
+      g: gs[i] ?? 0,
+      b: bs[i] ?? 0,
     });
+  }
+  return out;
+}
+
+function decodeUint32Array(reader: BinaryReader, count: number): number[] {
+  const raw = reader.bytes(count * 4);
+  const deinterleaved = decodeInterleaved(raw, count, 4);
+  const view = new DataView(
+    deinterleaved.buffer,
+    deinterleaved.byteOffset,
+    deinterleaved.byteLength
+  );
+
+  const out: number[] = [];
+  for (let i = 0; i < count; i++) {
+    out.push(view.getUint32(i * 4, false));
   }
   return out;
 }
@@ -306,27 +385,67 @@ function getPresetMatrix(id: number): number[] {
   return list[idx] || [1, 0, 0,  0, 1, 0,  0, 0, 1];
 }
 
+const CFRAME_EULER_BY_ID: Record<number, { x: number; y: number; z: number }> = {
+  0x02: { x:   0, y:    0, z:   0 },
+  0x03: { x:  90, y:    0, z:   0 },
+  0x05: { x:   0, y:  180, z: 180 },
+  0x06: { x: -90, y:    0, z:   0 },
+  0x07: { x:   0, y:  180, z:  90 },
+  0x09: { x:   0, y:   90, z:  90 },
+  0x0a: { x:   0, y:    0, z:  90 },
+  0x0c: { x:   0, y:  -90, z:  90 },
+  0x0d: { x: -90, y:  -90, z:   0 },
+  0x0e: { x:   0, y:  -90, z:   0 },
+  0x10: { x:  90, y:  -90, z:   0 },
+  0x11: { x:   0, y:   90, z: 180 },
+
+  0x14: { x:   0, y:  180, z:   0 },
+  0x15: { x: -90, y: -180, z:   0 },
+  0x17: { x:   0, y:    0, z: 180 },
+  0x18: { x:  90, y:  180, z:   0 },
+  0x19: { x:   0, y:    0, z: -90 },
+  0x1b: { x:   0, y:  -90, z: -90 },
+  0x1c: { x:   0, y: -180, z: -90 },
+  0x1e: { x:   0, y:   90, z: -90 },
+  0x1f: { x:  90, y:   90, z:   0 },
+  0x20: { x:   0, y:   90, z:   0 },
+  0x22: { x: -90, y:   90, z:   0 },
+  0x23: { x:   0, y:  -90, z: 180 },
+};
+
 function decodeCFrameArray(reader: BinaryReader, count: number) {
-  const orientations = Array.from(reader.bytes(count));
+  const rotations: number[][] = [];
+  const eulers: ({ x: number; y: number; z: number } | null)[] = [];
+  const orientationIds: number[] = [];
+
+  for (let i = 0; i < count; i++) {
+    const orientationId = reader.Uint8;
+    orientationIds.push(orientationId);
+
+    if (orientationId === 0) {
+      const rotation: number[] = [];
+      for (let r = 0; r < 9; r++) {
+        rotation.push(reader.Float32); // raw IEEE-754 little-endian
+      }
+      rotations.push(rotation);
+      eulers.push(null);
+    } else {
+      rotations.push([]); // 不再放可能錯誤的 preset matrix
+      eulers.push(CFRAME_EULER_BY_ID[orientationId] ?? { x: 0, y: 0, z: 0 });
+    }
+  }
+
   const xs = decodeFloat32Array(reader, count);
   const ys = decodeFloat32Array(reader, count);
   const zs = decodeFloat32Array(reader, count);
-  
+
   const out = [];
   for (let i = 0; i < count; i++) {
-    const orientationId = orientations[i];
-    let rotation: number[];
-    if (orientationId === 0) {
-      rotation = [];
-      for (let r = 0; r < 9; r++) {
-        rotation.push(reader.Float32);
-      }
-    } else {
-      rotation = getPresetMatrix(orientationId);
-    }
     out.push({
       position: [xs[i], ys[i], zs[i]],
-      rotation: rotation
+      rotation: rotations[i],
+      orientationId: orientationIds[i],
+      euler: eulers[i],
     });
   }
   return out;
@@ -344,25 +463,18 @@ function decodePropValues(reader: BinaryReader, dataType: number, count: number)
       return decodeBoolArray(reader, count);
 
     case 0x03: // Int32
-    case 0x0A: // Enum (usually behaves like Int32)
       return decodeInt32Array(reader, count);
 
-    case 0x04: { // Int64
-      const out: number[] = [];
-      for (let i = 0; i < count; i++) out.push(reader.Int64);
-      return out;
-    }
-
-    case 0x05: // Float32
+    case 0x04: // Float32
       return decodeFloat32Array(reader, count);
 
-    case 0x06: { // Float64
+    case 0x05: { // Float64
       const out: number[] = [];
       for (let i = 0; i < count; i++) out.push(reader.Float64);
       return out;
     }
 
-    case 0x07: { // UDim
+    case 0x06: { // UDim
       const scales = decodeFloat32Array(reader, count);
       const offsets = decodeInt32Array(reader, count);
       const out = [];
@@ -372,7 +484,7 @@ function decodePropValues(reader: BinaryReader, dataType: number, count: number)
       return out;
     }
 
-    case 0x08: { // UDim2
+    case 0x07: { // UDim2
       const scaleXs = decodeFloat32Array(reader, count);
       const scaleYs = decodeFloat32Array(reader, count);
       const offsetXs = decodeInt32Array(reader, count);
@@ -380,21 +492,20 @@ function decodePropValues(reader: BinaryReader, dataType: number, count: number)
       const out = [];
       for (let i = 0; i < count; i++) {
         out.push({
-          scaleX: scaleXs[i], scaleY: scaleYs[i],
-          offsetX: offsetXs[i], offsetY: offsetYs[i]
+          scaleX: scaleXs[i],
+          scaleY: scaleYs[i],
+          offsetX: offsetXs[i],
+          offsetY: offsetYs[i],
         });
       }
       return out;
     }
 
-    case 0x09: // CFrame
-      return decodeCFrameArray(reader, count);
+    case 0x0B: // BrickColor
+      return decodeUint32Array(reader, count);
 
-    case 0x0B: // Referent
-      return decodeReferentArray(reader, count);
-
-    case 0x0C: // Vector3
-      return decodeVector3Array(reader, count);
+    case 0x0C: // Color3
+      return decodeColor3Array(reader, count);
 
     case 0x0D: { // Vector2
       const xs = decodeFloat32Array(reader, count);
@@ -406,66 +517,72 @@ function decodePropValues(reader: BinaryReader, dataType: number, count: number)
       return out;
     }
 
-    case 0x0E: // Color3
-      return decodeColor3Array(reader, count);
+    case 0x0E: // Vector3
+      return decodeVector3Array(reader, count);
 
-    case 0x10: // Color3uint8
+    case 0x10: // CFrame
+      return decodeCFrameArray(reader, count);
+
+    case 0x12: // Enum
+      return decodeUint32Array(reader, count);
+
+    case 0x13: // Referent
+      return decodeReferentArray(reader, count);
+
+    case 0x19: { // PhysicalProperties
+      const out = [];
+      for (let i = 0; i < count; i++) {
+        const flags = reader.Uint8;
+        const isCustom = (flags & 0x01) !== 0;
+        const hasAcoustic = (flags & 0x02) !== 0;
+
+        if (!isCustom) {
+          out.push({
+            custom: false,
+            acousticAbsorption: hasAcoustic ? 1.0 : undefined,
+          });
+          continue;
+        }
+
+        const density = reader.Float32;
+        const friction = reader.Float32;
+        const elasticity = reader.Float32;
+        const frictionWeight = reader.Float32;
+        const elasticityWeight = reader.Float32;
+        const acousticAbsorption = hasAcoustic ? reader.Float32 : 1.0;
+
+        out.push({
+          custom: true,
+          density,
+          friction,
+          elasticity,
+          frictionWeight,
+          elasticityWeight,
+          acousticAbsorption,
+        });
+      }
+      return out;
+    }
+
+    case 0x1A: // Color3uint8
       return decodeColor3uint8Array(reader, count);
 
-    case 0x12: { // Font
+    case 0x1B: // Int64
+      return decodeInt64Array(reader, count);
+
+    case 0x20: { // Font
       const out = [];
       for (let i = 0; i < count; i++) {
         const family = reader.String;
-        const weight = reader.Uint8;
+        const weight = reader.Uint16;
         const style = reader.Uint8;
-        const hasCachedFaceId = reader.Uint8;
-        const cachedFaceId = hasCachedFaceId ? reader.String : null;
-        out.push({ family, weight, style, cachedFaceId });
-      }
-      return out;
-    }
-
-    case 0x13: { // SecurityCapabilities
-      const out = [];
-      for (let i = 0; i < count; i++) {
-        const capCount = reader.Int32;
-        const flags = reader.bytes(capCount);
-        let capVal = 0;
-        for (let f = 0; f < flags.length; f++) {
-          capVal = (capVal << 8) | flags[f];
-        }
-        out.push(capVal);
-      }
-      return out;
-    }
-
-    case 0x1B: { // SourceAssetId
-      const out = [];
-      for (let i = 0; i < count; i++) {
-        const len = reader.Uint8;
-        let val = 0;
-        switch (len) {
-          case 0:  val = 0; break;
-          case 1:  val = reader.Uint8; break;
-          case 2: {
-            const b1 = reader.Uint8;
-            const b2 = reader.Uint8;
-            val = (b2 << 8) | b1;
-            break;
-          }
-          case 4:  val = reader.Int32; break;
-          case 8:  val = reader.Int64; break;
-          default: val = 0; break;
-        }
-        out.push(val);
-      }
-      return out;
-    }
-
-    case 0x1D: { // BinaryString
-      const out = [];
-      for (let i = 0; i < count; i++) {
-        out.push(reader.BinaryString);
+        const cachedFaceId = reader.String;
+        out.push({
+          family,
+          weight,
+          style,
+          cachedFaceId: cachedFaceId || null,
+        });
       }
       return out;
     }
@@ -545,37 +662,38 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
     const uncompressedLen = reader.Uint32;
     reader.Int32; // skip reserved
 
-    const compressedData = reader.bytes(compressedLen);
-
     let decompressed: Uint8Array;
     if (compressedLen === 0) {
-      decompressed = new Uint8Array(0);
-    } else if (isZstd(compressedData)) {
-      try {
-        decompressed = decompress(compressedData);
-      } catch (err) {
-        console.warn(`Zstd decompression failed for chunk ${chunkName}:`, err);
-        decompressed = new Uint8Array(uncompressedLen);
-      }
+      decompressed = reader.bytes(uncompressedLen);
     } else {
-      try {
-        const out = new Uint8Array(uncompressedLen);
-        const wrote = lz4js.decompressBlock(
-          compressedData,
-          out,
-          0,
-          compressedData.length,
-          0
-        );
-
-        if (wrote < 0) {
-          throw new Error(`LZ4 returned ${wrote}`);
+      const compressedData = reader.bytes(compressedLen);
+      if (isZstd(compressedData)) {
+        try {
+          decompressed = decompress(compressedData);
+        } catch (err) {
+          console.warn(`Zstd decompression failed for chunk ${chunkName}:`, err);
+          decompressed = new Uint8Array(uncompressedLen);
         }
+      } else {
+        try {
+          const out = new Uint8Array(uncompressedLen);
+          const wrote = lz4js.decompressBlock(
+            compressedData,
+            out,
+            0,
+            compressedData.length,
+            0
+          );
 
-        decompressed = wrote === uncompressedLen ? out : out.subarray(0, wrote);
-      } catch (err) {
-        console.warn(`LZ4 decompression failed for chunk ${chunkName}, using raw fallback:`, err);
-        decompressed = compressedData;
+          if (wrote < 0) {
+            throw new Error(`LZ4 returned ${wrote}`);
+          }
+
+          decompressed = wrote === uncompressedLen ? out : out.subarray(0, wrote);
+        } catch (err) {
+          console.warn(`LZ4 decompression failed for chunk ${chunkName}, using raw fallback:`, err);
+          decompressed = compressedData;
+        }
       }
     }
 
@@ -584,23 +702,19 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
     if (chunkName === 'INST') {
       const typeId = chunkReader.Int32;
       const className = chunkReader.String;
-      const category = chunkReader.Uint8;
+      const objectFormat = chunkReader.Uint8;
       const count = chunkReader.Int32;
 
       const instanceIds = decodeReferentArray(chunkReader, count);
 
-      if (chunkReader.remaining > 0) {
-        chunkReader.Uint8; // skip referent type
-      }
-
-      if (category !== 0 && chunkReader.remaining >= count) {
-        chunkReader.bytes(count);
+      if (objectFormat === 1 && chunkReader.remaining >= count) {
+        chunkReader.bytes(count); // markers/services
       }
 
       console.log('INST', {
         typeId,
         className,
-        category,
+        objectFormat,
         count,
         instanceIds,
       });
@@ -608,7 +722,7 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
       classes[typeId] = {
         typeId,
         className,
-        category,
+        category: objectFormat,
         instanceIds,
       };
     } else if (chunkName === 'PROP') {
@@ -619,7 +733,17 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
       const classDef = classes[typeId];
       const count = classDef ? classDef.instanceIds.length : 0;
 
-      const values = decodePropValues(chunkReader, dataType, count);
+      let values: any[];
+
+      if (propertyName === 'AttributesSerialize' && dataType === 0x01) {
+        values = decodeBinaryStringArray(chunkReader, count).map(bytes => ({
+          _raw: Array.from(bytes),
+        }));
+      } else if (propertyName === 'Tags' && dataType === 0x01) {
+        values = decodeBinaryStringArray(chunkReader, count).map(parseTagsBlob);
+      } else {
+        values = decodePropValues(chunkReader, dataType, count);
+      }
 
       console.log('PROP', {
         className: classDef?.className,
@@ -743,54 +867,92 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
     1344: 'Pavement',
   };
 
+  function pickProp(obj: Record<string, any>, ...names: string[]) {
+    for (const name of names) {
+      if (obj[name] !== undefined) return obj[name];
+    }
+    return undefined;
+  }
+
   // 4. Map back to RobloxInstance schema
   return Object.values(tempInstances).map((temp) => {
     const mappedProps: any = {};
     const props = temp.properties;
 
-    if (props.Name) mappedProps.Name = props.Name;
-    if (props.Anchored !== undefined) mappedProps.Anchored = props.Anchored;
-    if (props.CanCollide !== undefined) mappedProps.CanCollide = props.CanCollide;
-    if (props.Transparency !== undefined) mappedProps.Transparency = props.Transparency;
-    if (props.Reflectance !== undefined) mappedProps.Reflectance = props.Reflectance;
-    if (props.Source !== undefined) {
-      if (props.Source instanceof Uint8Array) {
-        mappedProps.Source = new TextDecoder().decode(props.Source);
+    const nameProp = pickProp(props, 'Name', 'name');
+    if (nameProp !== undefined) mappedProps.Name = nameProp;
+
+    const anchoredProp = pickProp(props, 'Anchored', 'anchored');
+    if (anchoredProp !== undefined) mappedProps.Anchored = anchoredProp;
+
+    const canCollideProp = pickProp(props, 'CanCollide', 'canCollide');
+    if (canCollideProp !== undefined) mappedProps.CanCollide = canCollideProp;
+
+    const transparencyProp = pickProp(props, 'Transparency', 'transparency');
+    if (transparencyProp !== undefined) mappedProps.Transparency = transparencyProp;
+
+    const reflectanceProp = pickProp(props, 'Reflectance', 'reflectance');
+    if (reflectanceProp !== undefined) mappedProps.Reflectance = reflectanceProp;
+
+    const sourceProp = pickProp(props, 'Source', 'source');
+    if (sourceProp !== undefined) {
+      if (sourceProp instanceof Uint8Array) {
+        mappedProps.Source = new TextDecoder().decode(sourceProp);
       } else {
-        mappedProps.Source = props.Source;
+        mappedProps.Source = sourceProp;
       }
     }
-    if (props.Enabled !== undefined) mappedProps.Enabled = props.Enabled;
-    if (props.Brightness !== undefined) mappedProps.Brightness = props.Brightness;
-    if (props.TimeOfDay !== undefined) mappedProps.TimeOfDay = props.TimeOfDay;
-    if (props.GlobalShadows !== undefined) mappedProps.GlobalShadows = props.GlobalShadows;
 
-    if (props.Size) {
-      mappedProps.Size = { x: props.Size.x ?? 4, y: props.Size.y ?? 1, z: props.Size.z ?? 2 };
+    const enabledProp = pickProp(props, 'Enabled', 'enabled');
+    if (enabledProp !== undefined) mappedProps.Enabled = enabledProp;
+
+    const brightnessProp = pickProp(props, 'Brightness', 'brightness');
+    if (brightnessProp !== undefined) mappedProps.Brightness = brightnessProp;
+
+    const timeOfDayProp = pickProp(props, 'TimeOfDay', 'timeOfDay');
+    if (timeOfDayProp !== undefined) mappedProps.TimeOfDay = timeOfDayProp;
+
+    const globalShadowsProp = pickProp(props, 'GlobalShadows', 'globalShadows');
+    if (globalShadowsProp !== undefined) mappedProps.GlobalShadows = globalShadowsProp;
+
+    const sizeProp = pickProp(props, 'Size', 'size');
+    if (sizeProp) {
+      mappedProps.Size = { x: sizeProp.x ?? 4, y: sizeProp.y ?? 1, z: sizeProp.z ?? 2 };
     }
-    if (props.Position) {
-      mappedProps.Position = { x: props.Position.x ?? 0, y: props.Position.y ?? 0, z: props.Position.z ?? 0 };
-    } else if (props.CFrame && props.CFrame.position) {
-      const pos = props.CFrame.position;
+
+    const positionProp = pickProp(props, 'Position', 'position');
+    const cframeProp = pickProp(props, 'CFrame', 'cframe');
+
+    if (positionProp) {
+      mappedProps.Position = { x: positionProp.x ?? 0, y: positionProp.y ?? 0, z: positionProp.z ?? 0 };
+    } else if (cframeProp && cframeProp.position) {
+      const pos = cframeProp.position;
       mappedProps.Position = { x: pos[0], y: pos[1], z: pos[2] };
     }
 
-    if (props.Material !== undefined) {
-      if (typeof props.Material === 'number') {
-        mappedProps.Material = materialEnumMap[props.Material] || 'Plastic';
+    const materialProp = props.Material ?? props.material;
+    if (materialProp !== undefined) {
+      if (typeof materialProp === 'number') {
+        mappedProps.Material = materialEnumMap[materialProp] || 'Plastic';
       } else {
-        mappedProps.Material = props.Material;
+        mappedProps.Material = materialProp;
       }
     }
 
-    const parsedColor = parseColorToHex(props.Color || props.Color3 || props.Color3uint8);
+    const parsedColor = parseColorToHex(
+      props.Color ?? props.color ??
+      props.Color3 ?? props.color3 ??
+      props.Color3uint8 ?? props.color3uint8
+    );
     if (parsedColor) {
       mappedProps.Color = parsedColor;
     }
 
-    // Extract Euler angles ZYX order from CFrame rotation matrix
-    if (props.CFrame && props.CFrame.rotation) {
-      const r = props.CFrame.rotation; // 9 floats (3x3 matrix)
+    // Extract Euler angles ZYX order from CFrame rotation matrix or use preset Euler
+    if (cframeProp?.euler) {
+      mappedProps.Rotation = cframeProp.euler;
+    } else if (cframeProp?.rotation && cframeProp.rotation.length === 9) {
+      const r = cframeProp.rotation; // 9 floats (3x3 matrix)
       const sinY = Math.max(-1, Math.min(1, -r[6]));
       const angleY = Math.asin(sinY);
       const angleX = Math.atan2(r[7], r[8]);
@@ -806,7 +968,7 @@ export function parseRobloxBinary(arrayBuffer: ArrayBuffer): RobloxInstance[] {
 
     return {
       id: temp.referentId.toString(),
-      name: props.Name || temp.className,
+      name: nameProp || temp.className,
       className: temp.className as InstanceClass,
       parentId: temp.parentId !== null ? temp.parentId.toString() : null,
       rawProperties: props,
